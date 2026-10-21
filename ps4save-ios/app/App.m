@@ -261,10 +261,16 @@ static const void *kPickerDelegateKey = &kPickerDelegateKey;
 @interface PickerDelegate : NSObject <UIDocumentPickerDelegate>
 @property (nonatomic, copy) PickBlock block;
 @property (nonatomic, assign) BOOL importMode;
+@property (nonatomic, assign) BOOL folderMode;
+@property (nonatomic, assign) BOOL rawMode;
+@property (nonatomic, copy) void (^rawBlock)(NSArray<NSURL *> *urls);
 + (void)showImport:(UIViewController *)host block:(PickBlock)cb;
 + (PickerDelegate *)showHost:(UIViewController *)host block:(PickBlock)cb;
++ (void)showFilesRaw:(UIViewController *)host
+    block:(void (^)(NSArray<NSURL *> *urls))cb;
 + (void)activate:(UIDocumentPickerViewController *)p
         delegate:(PickerDelegate *)d host:(UIViewController *)host;
++ (void)showFolder:(UIViewController *)host block:(PickBlock)cb;
 + (void)showExport:(UIViewController *)host block:(PickBlock)cb
     suggested:(NSString *)name;
 @end
@@ -275,6 +281,24 @@ static const void *kPickerDelegateKey = &kPickerDelegateKey;
     PickerDelegate *d = [self showHost:host block:cb];
     if (!d) return;
     d.importMode = YES;
+}
+
+/* File-box flow: the callback receives the RAW picked URLs so it can route
+ * each one into its own destination directory (the import wrapper stages
+ * into an opaque pair-<uuid>/ dir, which boxes must not do). */
++ (void)showFilesRaw:(UIViewController *)host
+    block:(void (^)(NSArray<NSURL *> *urls))cb {
+    UIDocumentPickerViewController *p =
+        [[UIDocumentPickerViewController alloc]
+            initForOpeningContentTypes:@[
+                [UTType typeWithIdentifier:@"public.item"]
+            ]
+                               asCopy:YES];
+    p.allowsMultipleSelection = YES;
+    PickerDelegate *d = [self showHost:host block:nil];
+    d.rawMode = YES;
+    d.rawBlock = [cb copy];
+    [self activate:p delegate:d host:host];
 }
 
 + (PickerDelegate *)showHost:(UIViewController *)host block:(PickBlock)cb {
@@ -313,10 +337,77 @@ static const void *kPickerDelegateKey = &kPickerDelegateKey;
     [host presentViewController:p animated:YES completion:nil];
 }
 
+/* Apple's documented directory pattern: content type folder, asCopy NO,
+ * then copy the picked tree ourselves while holding the security-scope
+ * grant. The result is a normal folder under Documents/imports. */
+static NSString *CopyDirectoryUnderScope(NSURL *dirURL) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *imports = [DocumentsRoot() stringByAppendingPathComponent:
+                                               @"imports"];
+    NSString *name = dirURL.lastPathComponent ?: @"save";
+    NSString *dst = [imports stringByAppendingPathComponent:name];
+    NSInteger n = 1;
+    while ([fm fileExistsAtPath:dst]) {
+        dst = [imports stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%@ (%ld)", name, (long)(n++)]];
+    }
+    NSError *err = nil;
+    [fm createDirectoryAtPath:[dst stringByDeletingLastPathComponent]
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    BOOL scoped = [dirURL startAccessingSecurityScopedResource];
+    BOOL ok = [fm copyItemAtPath:dirURL.path toPath:dst error:&err];
+    if (scoped) [dirURL stopAccessingSecurityScopedResource];
+    if (!ok) {
+        NSString *msg = err.localizedDescription ?: @"copy failed";
+        return [NSString stringWithFormat:@"__error__%@", msg];
+    }
+    return dst;
+}
+
+/* Exported constant from UTCoreTypes (a dynamic identifier lookup can
+ * return nil and blow the picker array up — this cannot). */
+extern UTType *const UTTypeFolder;
+
++ (void)showFolder:(UIViewController *)host block:(PickBlock)cb {
+    PickerDelegate *d = [self showHost:host block:cb];
+    if (!d) return;
+    d.folderMode = YES;
+
+    /* Legacy-pipeline switch: plist PS4LegacyPickerMode routes folder picks
+     * through the pre-trust Import mode instead of the modern open-grant
+     * machinery. The sideload signing ecosystem ships exactly this as its
+     * "document picker fix" (VexSign's FilePickerForcePatch: import-mode
+     * forcing + delegate relocation), evidence that Open-in-place stalls on
+     * Feather-signed installs. */
+    NSNumber *legacy = [NSBundle.mainBundle.infoDictionary
+        objectForKey:@"PS4LegacyPickerMode"];
+    UIDocumentPickerViewController *p;
+    if (legacy.boolValue) {
+        p = [[UIDocumentPickerViewController alloc]
+            initWithDocumentTypes:@[ UTTypeFolder.identifier ]
+                           inMode:UIDocumentPickerModeImport];
+    } else {
+        /* documented open-in-place form, no asCopy — for isolation testing
+         * of non-app-container locations (iCloud Drive, Downloads,
+         * providers) */
+        p = [[UIDocumentPickerViewController alloc]
+            initForOpeningContentTypes:@[ UTTypeFolder ]];
+    }
+    p.allowsMultipleSelection = NO;
+    [self activate:p delegate:d host:host];
+}
+
 - (void)documentPicker:(UIDocumentPickerViewController *)controller
     didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    if (!urls.count || !self.block) return;
-    if (self.importMode) {
+    if (!urls.count) return;
+    if (self.rawMode) {
+        if (self.rawBlock) self.rawBlock(urls);
+        return;
+    }
+    if (!self.block) return;
+    if (self.folderMode) {
+        self.block(CopyDirectoryUnderScope(urls.firstObject));
+    } else if (self.importMode) {
         self.block(MoveIntoImportsBundle(urls));
     } else {
         self.block(urls.firstObject.path);
@@ -328,23 +419,333 @@ static const void *kPickerDelegateKey = &kPickerDelegateKey;
 
 @end
 
-/* System import picker for input/sample/config rows. folderMode picks a
- * whole directory (UIDocumentPicker supports UTType.folder; asCopy copies
- * the tree into tmp, and we then move it under Documents/imports). */
+/* System import picker for files (input/sample/config rows). */
 static void PresentImportPicker(UIViewController *host, PickBlock cb,
-                                NSString *suggestedName, BOOL folderMode) {
+                                NSString *suggestedName) {
     UIDocumentPickerViewController *p =
         [[UIDocumentPickerViewController alloc]
             initForOpeningContentTypes:@[
-                [UTType typeWithIdentifier:
-                    folderMode ? @"public.folder" : @"public.item"]
+                [UTType typeWithIdentifier:@"public.item"]
             ]
                                asCopy:YES];
-    p.allowsMultipleSelection = !folderMode;
+    p.allowsMultipleSelection = YES;
     PickerDelegate *d = [PickerDelegate showHost:host block:cb];
     d.importMode = YES;
     [PickerDelegate activate:p delegate:d host:host];
 }
+
+#pragma mark - In-app sandbox folder browser
+
+/* System folder pickers dead-end on the local provider for the app's own
+ * container, so folder selection lives in-app: browse the Documents tree,
+ * tap a folder to descend, "Use this folder" commits. */
+@interface SaveBrowserVC : UITableViewController
+@property (nonatomic, copy) NSString *currentDir;
+@property (nonatomic, copy) NSString *rootDir;
+@property (nonatomic, copy) void (^onPick)(NSString *path);
+@property (nonatomic, strong) NSMutableArray<NSString *> *dirs;
+@property (nonatomic, strong) NSMutableArray<NSString *> *files;
+@end
+
+@implementation SaveBrowserVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.rootDir = DocumentsRoot();
+    if (!self.currentDir) self.currentDir = self.rootDir;
+    self.title = @"Select folder";
+
+    UIBarButtonItem *use =
+        [[UIBarButtonItem alloc] initWithTitle:@"Use this folder"
+            style:UIBarButtonItemStyleDone target:self
+            action:@selector(useFolder)];
+    UIBarButtonItem *close = [[UIBarButtonItem alloc]
+        initWithBarButtonSystemItem:UIBarButtonSystemItemCancel
+        target:self action:@selector(dismissSelf)];
+    use.accessibilityLabel = @"Use this folder";
+    self.navigationItem.rightBarButtonItem = use;
+    self.navigationItem.leftBarButtonItem = close;
+    [self reload];
+}
+
+- (void)dismissSelf {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)useFolder {
+    if (self.onPick) self.onPick(self.currentDir);
+    [self dismissSelf];
+}
+
+- (void)reload {
+    self.dirs = [NSMutableArray array];
+    self.files = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSError *err = nil;
+    NSArray *items = [fm contentsOfDirectoryAtPath:self.currentDir error:&err];
+    for (NSString *name in [items sortedArrayUsingSelector:@selector(compare:)])
+    {
+        NSString *full =
+            [self.currentDir stringByAppendingPathComponent:name];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:full isDirectory:&isDir]) {
+            if (isDir) [self.dirs addObject:name];
+            else [self.files addObject:name];
+        }
+    }
+    [self.tableView reloadData];
+}
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
+    return 1 + self.dirs.count + self.files.count; /* row 0 = ".." */
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv
+        cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:@"cell"];
+    if (!cell)
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                      reuseIdentifier:@"cell"];
+    cell.backgroundColor = COL_BG2;
+    cell.textLabel.textColor = COL_FG;
+    cell.textLabel.font = MonoFont(14);
+    cell.detailTextLabel.textColor = COL_MUTED;
+    cell.detailTextLabel.font = MonoFont(10);
+
+    NSInteger i = ip.row;
+    if (i == 0) {
+        cell.textLabel.text = @"..";
+        cell.detailTextLabel.text = self.currentDir;
+        cell.accessoryType = UITableViewCellAccessoryNone;
+    } else if (i <= (NSInteger)self.dirs.count) {
+        NSString *name = self.dirs[i - 1];
+        cell.textLabel.text = [name stringByAppendingString:@"/"];
+        cell.detailTextLabel.text = @"";
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    } else {
+        NSString *name = self.files[i - 1 - (NSInteger)self.dirs.count];
+        NSString *full =
+            [self.currentDir stringByAppendingPathComponent:name];
+        NSDictionary *attr = [[NSFileManager defaultManager]
+            attributesOfItemAtPath:full error:nil];
+        cell.textLabel.text = name;
+        cell.textLabel.textColor = COL_MUTED;
+        cell.detailTextLabel.text =
+            [NSString stringWithFormat:@"%llu B",
+                (unsigned long long)[attr fileSize]];
+        cell.accessoryType = UITableViewCellAccessoryNone;
+    }
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    NSInteger i = ip.row;
+    if (i == 0) {
+        if ([self.currentDir isEqualToString:self.rootDir]) return;
+        self.currentDir = [self.currentDir stringByDeletingLastPathComponent];
+        [self reload];
+        return;
+    }
+    if (i <= (NSInteger)self.dirs.count) {
+        self.currentDir = [self.currentDir
+            stringByAppendingPathComponent:self.dirs[i - 1]];
+        [self reload];
+    }
+    /* files are selectable by the picker elsewhere — here dirs only */
+}
+
+@end
+
+#pragma mark - File boxes: rebuild a save folder from file picks
+
+/* Copy one picked file into dir, dedup-suffixing on collision. Directories
+ * cannot go into boxes; their names are reported back for the user note. */
+static void CopyFileIntoDir(NSURL *src, NSString *dir,
+                            NSMutableArray<NSString *> *skippedDirs) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:src.path isDirectory:&isDir] || isDir) {
+        [skippedDirs addObject:src.lastPathComponent ?: @"?"];
+        return;
+    }
+    NSString *name = src.lastPathComponent ?: @"file.bin";
+    NSString *dst = [dir stringByAppendingPathComponent:name];
+    NSInteger n = 1;
+    while ([fm fileExistsAtPath:dst]) {
+        NSString *stem = [name stringByDeletingPathExtension];
+        NSString *ext = name.pathExtension;
+        dst = ext.length
+            ? [dir stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"%@ (%ld).%@",
+                       stem, (long)(n++), ext]]
+            : [dir stringByAppendingPathComponent:
+                   [NSString stringWithFormat:@"%@ (%ld)", stem, (long)(n++)]];
+    }
+    [fm copyItemAtPath:src.path toPath:dst error:nil];
+}
+
+/* Two-slot flow over the working asCopy file picker: box 0 collects the
+ * files of the save root, box 1 the files of sce_sys/. The rebuilt folder
+ * is a normal tree the core treats exactly like a picked folder. */
+@interface SaveBoxesVC : UITableViewController
+@property (nonatomic, copy) void (^onCommit)(NSString *path);
+@property (nonatomic, copy) NSString *buildDir;
+@property (nonatomic, strong) NSMutableArray<NSString *> *saveFiles;
+@property (nonatomic, strong) NSMutableArray<NSString *> *sysFiles;
+@end
+
+@implementation SaveBoxesVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"File boxes";
+    if (!self.buildDir) {
+        self.buildDir = [[DocumentsRoot() stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"imports/rebuild-%@",
+                [[NSUUID UUID] UUIDString]]] copy];
+    }
+    self.saveFiles = [NSMutableArray new];
+    self.sysFiles = [NSMutableArray new];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc]
+        initWithTitle:@"Build & use" style:UIBarButtonItemStyleDone
+        target:self action:@selector(buildTapped)];
+    UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+        initWithTarget:self action:@selector(longPress:)];
+    [self.tableView addGestureRecognizer:lp];
+}
+
+- (NSString *)boxDir:(NSInteger)boxIdx {
+    return boxIdx == 0
+        ? self.buildDir
+        : [self.buildDir stringByAppendingPathComponent:@"sce_sys"];
+}
+
+- (NSMutableArray<NSString *> *)boxFiles:(NSInteger)boxIdx {
+    return boxIdx == 0 ? self.saveFiles : self.sysFiles;
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
+    return 1;
+}
+
+- (NSInteger)tableView:(UITableView *)tv
+    numberOfRowsInSection:(NSInteger)s {
+    return 2;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv
+    cellForRowAtIndexPath:(NSIndexPath *)ip {
+    UITableViewCell *c = [self.tableView dequeueReusableCellWithIdentifier:@"b"];
+    if (!c) c = [[UITableViewCell alloc]
+        initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:@"b"];
+    c.textLabel.text = (ip.row == 0) ? @"save files" : @"sce_sys files";
+    NSInteger n = [self boxFiles:ip.row].count;
+    c.detailTextLabel.text = n
+        ? [NSString stringWithFormat:@"%ld file%s picked",
+              (long)n, n == 1 ? "" : "s"]
+        : @"tap to pick";
+    c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    return c;
+}
+
+- (NSString *)tableView:(UITableView *)tv
+    titleForFooterInSection:(NSInteger)s {
+    return @"Pick FILES, not folders. The sce_sys box must include "
+           @"param.sfo \u2014 Build is refused without it.";
+}
+
+- (void)tableView:(UITableView *)tv
+    didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    [self pickForBox:ip.row];
+}
+
+- (void)longPress:(UILongPressGestureRecognizer *)gr {
+    if (gr.state != UIGestureRecognizerStateBegan) return;
+    CGPoint p = [gr locationInView:self.tableView];
+    NSIndexPath *ip = [self.tableView indexPathForRowAtPoint:p];
+    if (!ip) return;
+    NSMutableArray<NSString *> *box = [self boxFiles:ip.row];
+    if (!box.count) return;
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:(ip.row == 0) ? @"save files" : @"sce_sys files"
+        message:@"Clear every file in this box?"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Clear"
+        style:UIAlertActionStyleDestructive handler:^(UIAlertAction *act) {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            for (NSString *fn in box)
+                [fm removeItemAtPath:
+                    [[self boxDir:ip.row]
+                        stringByAppendingPathComponent:fn]
+                    error:nil];
+            [box removeAllObjects];
+            [self.tableView reloadRowsAtIndexPaths:@[ip]
+                withRowAnimation:UITableViewRowAnimationNone];
+        }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"Keep"
+        style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)noteSkipped:(NSArray<NSString *> *)skipped {
+    UIAlertController *a = [UIAlertController
+        alertControllerWithTitle:@"Folders can't go in boxes"
+        message:[skipped componentsJoinedByString:@", "]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"Pick the files inside"
+        style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)reloadBoxRow:(NSInteger)boxIdx {
+    [self.tableView reloadRowsAtIndexPaths:
+        @[[NSIndexPath indexPathForRow:boxIdx inSection:0]]
+        withRowAnimation:UITableViewRowAnimationNone];
+}
+
+- (void)pickForBox:(NSInteger)boxIdx {
+    NSString *dst = [self boxDir:boxIdx];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dst
+        withIntermediateDirectories:YES attributes:nil error:nil];
+    __weak SaveBoxesVC *ws = self;
+    [PickerDelegate showFilesRaw:self block:^(NSArray<NSURL *> *urls) {
+        __strong SaveBoxesVC *s = ws;
+        if (!s) return;
+        NSMutableArray<NSString *> *skipped = [NSMutableArray new];
+        for (NSURL *u in urls) CopyFileIntoDir(u, dst, skipped);
+        NSMutableArray<NSString *> *box = [s boxFiles:boxIdx];
+        [box removeAllObjects];
+        [box addObjectsFromArray:
+            [[NSFileManager defaultManager]
+                contentsOfDirectoryAtPath:dst error:nil]];
+        [s reloadBoxRow:boxIdx];
+        if (skipped.count) [s noteSkipped:skipped];
+    }];
+}
+
+- (void)buildTapped {
+    if (![NSFileManager.defaultManager fileExistsAtPath:
+            [[self boxDir:1] stringByAppendingPathComponent:@"param.sfo"]]) {
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"sce_sys box is missing param.sfo"
+            message:@"The encryptor reads SAVEDATA_BLOCKS and the save's "
+                    @"directory name from it. Pick param.sfo into the "
+                    @"sce_sys box first."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"Ok"
+            style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    NSString *path = self.buildDir;
+    [self.navigationController dismissViewControllerAnimated:YES
+        completion:nil];
+    if (self.onCommit) self.onCommit(path);
+}
+
+@end
 
 #pragma mark - Command view controller
 
@@ -502,7 +903,7 @@ static const void *kKindRefKey = &kKindRefKey;
         [g notificationOccurred:UINotificationFeedbackTypeSuccess];
         [s setStatus:@"config imported; you're set" kind:@"ok"];
     };
-    PresentImportPicker(self, picked, @"config.ini", NO);
+    PresentImportPicker(self, picked, @"config.ini");
 }
 
 /* One field card: caption + rounded container(field + browse icon button).
@@ -736,6 +1137,10 @@ static const void *kKindRefKey = &kKindRefKey;
     void (^onPick)(NSString *) = ^(NSString *path) {
         __strong CommandVC *s = ws;
         if (!s) return;
+        if ([path hasPrefix:@"__error__"]) {
+            [s setStatus:[path substringFromIndex:9] kind:@"err"];
+            return;
+        }
         tf.text = path;
         [s persist];
     };
@@ -746,11 +1151,67 @@ static const void *kKindRefKey = &kKindRefKey;
         if (!sug.length)
             sug = [NSString stringWithFormat:@"%@-output.bin", self.op];
         [PickerDelegate showExport:self block:onPick suggested:sug];
+    } else if ([kind isEqualToString:@"input"] && self.inputWantsFolder) {
+        UIAlertController *how = [UIAlertController
+            alertControllerWithTitle:@"Pick folder"
+            message:@"Where does the save folder live?"
+            preferredStyle:UIAlertControllerStyleAlert];
+        void (^commit)(NSString *) = ^(NSString *path) {
+            __strong CommandVC *s = ws;
+            if (!s) return;
+            if ([path hasPrefix:@"__error__"]) {
+                [s setStatus:[path substringFromIndex:9] kind:@"err"];
+                return;
+            }
+            tf.text = path;
+            [s persist];
+        };
+        void (^presentBrowser)(void) = ^{
+            __strong CommandVC *s = ws;
+            if (!s) return;
+            SaveBrowserVC *b = [SaveBrowserVC new];
+            b.onPick = commit;
+            UINavigationController *nav = [[UINavigationController alloc]
+                initWithRootViewController:b];
+            nav.navigationBar.barStyle = UIBarStyleBlack;
+            [s presentViewController:nav animated:YES completion:nil];
+        };
+        void (^presentSystem)(void) = ^{
+            __strong CommandVC *s = ws;
+            if (!s) return;
+            [PickerDelegate showFolder:s block:commit];
+        };
+        void (^presentBoxes)(void) = ^{
+            __strong CommandVC *s = ws;
+            if (!s) return;
+            SaveBoxesVC *b = [SaveBoxesVC new];
+            b.onCommit = commit;
+            UINavigationController *nav = [[UINavigationController alloc]
+                initWithRootViewController:b];
+            nav.navigationBar.barStyle = UIBarStyleBlack;
+            [s presentViewController:nav animated:YES completion:nil];
+        };
+        [how addAction:[UIAlertAction actionWithTitle:
+            @"File boxes: pick files, rebuild folder (works everywhere)"
+            style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+                presentBoxes();
+            }]];
+
+        [how addAction:[UIAlertAction actionWithTitle:
+            @"In-app: browse Documents (recommended)"
+            style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+                presentBrowser();
+            }]];
+        [how addAction:[UIAlertAction actionWithTitle:
+            @"System folder picker (iCloud / Downloads)"
+            style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
+                presentSystem();
+            }]];
+        [how addAction:[UIAlertAction actionWithTitle:@"Cancel"
+            style:UIAlertActionStyleCancel handler:nil]];
+        [self presentViewController:how animated:YES completion:nil];
     } else {
-        BOOL folderPick =
-            [kind isEqualToString:@"input"] && self.inputWantsFolder;
-        PresentImportPicker(self, onPick, tf.text.lastPathComponent,
-                            folderPick);
+        PresentImportPicker(self, onPick, tf.text.lastPathComponent);
     }
 }
 
@@ -853,20 +1314,12 @@ static const void *kKindRefKey = &kKindRefKey;
 
 #pragma mark - App delegate
 
-@interface AppDelegate : UIResponder <UIApplicationDelegate>
-@property (nonatomic, strong) UIWindow *window;
-@end
+#pragma mark - Scene lifecycle
 
-@implementation AppDelegate
-
-/* UIApplicationMain looks the delegate up by class name at runtime, so
- * nothing statically references this class — dead stripping would drop it
- * entirely and the app would crash before any UI appears. Constructors are
- * dead-strip roots and the class reference inside anchors the symbol. */
-static volatile Class AppDelegateClassAnchor;
-__attribute__((used, constructor)) static void AppDelegateAnchor(void) {
-    AppDelegateClassAnchor = [AppDelegate class];
-}
+/* Adopted scene-based lifecycle: non-scene apps are the legacy path Apple is
+ * sunsetting (iOS 27 SDK builds must adopt scenes), and open-in-place grants
+ * handed to a document picker are routed through the scene pipeline on
+ * modern iOS. Folder picking currently dead-ends on non-scene builds. */
 
 static void StyleSystemBars(void) {
     UINavigationBarAppearance *ap = [UINavigationBarAppearance new];
@@ -885,14 +1338,9 @@ static void StyleSystemBars(void) {
     [[UITabBar appearance] setStandardAppearance:ta];
 }
 
-- (BOOL)application:(UIApplication *)app
-    didFinishLaunchingWithOptions:(NSDictionary *)opts {
-    [self copyBundledConfig];
-
-    self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    self.window.backgroundColor = COL_BG;
-    self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
-
+/* The six command tabs; built here so the scene-connect path (the only
+ * launch path now) owns one definition. */
+static UITabBarController *MakeRootController(void) {
     /* decrypt */
     CommandVC *decrypt = [CommandVC new];
     decrypt.cmd = CMD_DECRYPT;
@@ -973,9 +1421,73 @@ static void StyleSystemBars(void) {
     tabs.viewControllers = @[ nd, ne, nr, ng, ni, nu ];
     tabs.tabBar.tintColor = COL_ACCENT;
     tabs.tabBar.unselectedItemTintColor = COL_MUTED;
+    return tabs;
+}
 
-    self.window.rootViewController = tabs;
+/* SceneDelegate is referenced only by a string inside Info.plist's
+ * UIApplicationSceneManifest — nothing statically links it, so without the
+ * constructor anchor above, dead stripping would drop the class and the app
+ * would crash at launch. */
+@interface SceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property (nonatomic, strong) UIWindow *window;
+@end
+
+@implementation SceneDelegate
+
+/* Runtime lookup by name from Info.plist means nothing references this class
+ * statically — anchor it or dead stripping removes it (same as AppDelegate). */
+static volatile Class SceneDelegateClassAnchor;
+__attribute__((used, constructor)) static void SceneDelegateAnchor(void) {
+    SceneDelegateClassAnchor = [SceneDelegate class];
+}
+
+- (void)scene:(UIScene *)scene
+    willConnectToSession:(UISceneSession *)session
+    options:(UISceneConnectionOptions *)connectionOptions {
+    UIWindowScene *ws = (UIWindowScene *)scene;
+    if (![ws isKindOfClass:[UIWindowScene class]]) return;
+
+    self.window = [[UIWindow alloc] initWithWindowScene:ws];
+    self.window.backgroundColor = COL_BG;
+    self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    self.window.rootViewController = MakeRootController();
     [self.window makeKeyAndVisible];
+}
+
+@end
+
+@interface AppDelegate : UIResponder <UIApplicationDelegate>
+@property (nonatomic, strong) UIWindow *window;
+@end
+
+@implementation AppDelegate
+
+/* UIApplicationMain looks the delegate up by class name at runtime, so
+ * nothing statically references this class — dead stripping would drop it
+ * entirely and the app would crash before any UI appears. Constructors are
+ * dead-strip roots and the class reference inside anchors the symbol. */
+static volatile Class AppDelegateClassAnchor;
+__attribute__((used, constructor)) static void AppDelegateAnchor(void) {
+    AppDelegateClassAnchor = [AppDelegate class];
+}
+
+- (BOOL)application:(UIApplication *)app
+    didFinishLaunchingWithOptions:(NSDictionary *)opts {
+    [self copyBundledConfig];
+
+    /* Dual-mode launch: with a scene manifest we let SceneDelegate build the
+     * window (scene pipeline). Without one — legacy installs like the C test
+     * variant — fall back to the classic window path. Main app has the
+     * manifest, so this branch stays dormant for it. */
+    if (![NSBundle.mainBundle
+            objectForInfoDictionaryKey:@"UIApplicationSceneManifest"]) {
+        self.window = [[UIWindow alloc] initWithFrame:
+            [UIScreen mainScreen].bounds];
+        self.window.backgroundColor = COL_BG;
+        self.window.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+        self.window.rootViewController = MakeRootController();
+        [self.window makeKeyAndVisible];
+    }
     return YES;
 }
 
