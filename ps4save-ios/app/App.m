@@ -328,14 +328,19 @@ static const void *kPickerDelegateKey = &kPickerDelegateKey;
 
 @end
 
-/* System import picker for input/sample/config rows. */
+/* System import picker for input/sample/config rows. folderMode picks a
+ * whole directory (UIDocumentPicker supports UTType.folder; asCopy copies
+ * the tree into tmp, and we then move it under Documents/imports). */
 static void PresentImportPicker(UIViewController *host, PickBlock cb,
-                                NSString *suggestedName) {
+                                NSString *suggestedName, BOOL folderMode) {
     UIDocumentPickerViewController *p =
         [[UIDocumentPickerViewController alloc]
-            initForOpeningContentTypes:@[ [UTType typeWithIdentifier:@"public.item"] ]
+            initForOpeningContentTypes:@[
+                [UTType typeWithIdentifier:
+                    folderMode ? @"public.folder" : @"public.item"]
+            ]
                                asCopy:YES];
-    p.allowsMultipleSelection = YES;
+    p.allowsMultipleSelection = !folderMode;
     PickerDelegate *d = [PickerDelegate showHost:host block:cb];
     d.importMode = YES;
     [PickerDelegate activate:p delegate:d host:host];
@@ -358,6 +363,7 @@ static void PresentImportPicker(UIViewController *host, PickBlock cb,
 @property (nonatomic, assign) BOOL wantsAccount;
 @property (nonatomic, assign) BOOL needsInput; /* gate on input (default YES) */
 @property (nonatomic, assign) BOOL wantsImportConfig; /* utils: ensure config */
+@property (nonatomic, assign) BOOL inputWantsFolder; /* encrypt: pick a dir */
 
 @property (nonatomic, strong) UITextField *configField;
 @property (nonatomic, strong) UITextField *inputField;
@@ -496,7 +502,7 @@ static const void *kKindRefKey = &kKindRefKey;
         [g notificationOccurred:UINotificationFeedbackTypeSuccess];
         [s setStatus:@"config imported; you're set" kind:@"ok"];
     };
-    PresentImportPicker(self, picked, @"config.ini");
+    PresentImportPicker(self, picked, @"config.ini", NO);
 }
 
 /* One field card: caption + rounded container(field + browse icon button).
@@ -504,12 +510,16 @@ static const void *kKindRefKey = &kKindRefKey;
 - (void)buildRowFor:(NSString *)kind {
     NSString *title, *hint, *icon;
     BOOL isOutput = NO;
+    BOOL isFolderPick =
+        [kind isEqualToString:@"input"] && self.inputWantsFolder;
     if ([kind isEqualToString:@"config"]) {
         title = @"CONFIG"; hint = @"config.ini path";
         icon = @"gearshape";
     } else if ([kind isEqualToString:@"input"]) {
-        title = @"INPUT FILE"; hint = @"pick a save from anywhere...";
-        icon = @"folder";
+        title = isFolderPick ? @"SAVE FOLDER" : @"INPUT FILE";
+        hint = isFolderPick ? @"pick the save folder (contains sce_sys)..."
+                            : @"pick a save from anywhere...";
+        icon = isFolderPick ? @"folder" : @"doc.badge.plus";
     } else if ([kind isEqualToString:@"sample"]) {
         title = @"REGION SAMPLE"; hint = @"target region save...";
         icon = @"folder";
@@ -737,7 +747,10 @@ static const void *kKindRefKey = &kKindRefKey;
             sug = [NSString stringWithFormat:@"%@-output.bin", self.op];
         [PickerDelegate showExport:self block:onPick suggested:sug];
     } else {
-        PresentImportPicker(self, onPick, tf.text.lastPathComponent);
+        BOOL folderPick =
+            [kind isEqualToString:@"input"] && self.inputWantsFolder;
+        PresentImportPicker(self, onPick, tf.text.lastPathComponent,
+                            folderPick);
     }
 }
 
@@ -889,12 +902,13 @@ static void StyleSystemBars(void) {
     decrypt.title = @"Decrypt";
     decrypt.tabBarItem.image = [UIImage systemImageNamed:@"lock.open"];
 
-    /* encrypt */
+    /* encrypt: encrypt takes an extracted save FOLDER (sce_sys inside) */
     CommandVC *encrypt = [CommandVC new];
     encrypt.cmd = CMD_ENCRYPT;
     encrypt.op = @"encrypt";
     encrypt.runTitle = @"Encrypt";
     encrypt.wantsOutput = YES;
+    encrypt.inputWantsFolder = YES;
     encrypt.title = @"Encrypt";
     encrypt.tabBarItem.image = [UIImage systemImageNamed:@"lock"];
 
