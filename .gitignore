@@ -1,0 +1,17 @@
+# build outputs
+/target/
+ps4save-ios/Payload/
+ps4save-ios/PS4SaveTool.ipa
+ps4save-ios/build/
+ps4save-ios/xtoolapp/.build/
+ps4save-ios/xtoolapp/xtool/
+ps4save-ios/ios_core/target/
+
+# keys — NEVER commit
+config.ini
+
+# local artifacts
+*.log
+__pycache__/
+*.pyc
+.DS_Store

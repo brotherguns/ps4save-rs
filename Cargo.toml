@@ -1,0 +1,45 @@
+[package]
+name = "ps4save-rs"
+version = "0.1.2"
+edition = "2021"
+default-run = "ps4save-rs"
+
+[lib]
+name = "ps4save_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+aes = "0.8"
+clap = { version = "4", features = ["derive"], optional = true }
+clap_complete = { version = "4", optional = true }
+colored = { version = "3", optional = true }
+eframe = { version = "0.31", optional = true, features = ["default_fonts", "glow"] }
+dirs = "6"
+libc = { version = "0.2", optional = true }
+rfd = { version = "0.15", optional = true }
+flate2 = { version = "1", features = ["zlib-rs"] }
+getrandom = "0.2"
+hmac = "0.12"
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"], optional = true }
+rust-ini = "0.21"
+sha2 = "0.10"
+thiserror = "2"
+xts-mode = "0.5"
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:clap_complete", "dep:colored"]
+python = ["dep:pyo3"]
+gui = ["dep:eframe", "dep:rfd", "dep:libc", "dep:colored"]
+ios = ["dep:libc", "dep:colored"]
+all = ["cli", "gui"]
+
+[[bin]]
+name = "ps4save-rs"
+required-features = ["cli"]
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "fat"
+codegen-units = 1

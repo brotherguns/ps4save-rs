@@ -1,0 +1,18 @@
+[package]
+name = "ps4save-ios-core"
+version = "0.1.2"
+edition = "2021"
+
+[lib]
+name = "ps4save_ios_core"
+crate-type = ["staticlib"]
+
+[dependencies]
+ps4save-rs = { path = "../..", features = ["ios"], default-features = false }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = "fat"
+codegen-units = 1
